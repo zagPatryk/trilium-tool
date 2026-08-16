@@ -358,7 +358,10 @@ class TriliumClient:
             return body.decode("utf-8")
         if not body:
             return None
-        return json.loads(body)
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Invalid JSON response from Trilium") from exc
 
     def search(self, query: str) -> list[dict[str, Any]]:
         if not isinstance(query, str) or not query.strip():
@@ -412,7 +415,7 @@ class TriliumClient:
             raise ValidationError("Idempotency key is empty")
         note_id = _note_id_for_idempotency(idempotency_key)
         try:
-            readback = self.read(note_id)
+            self.read(note_id)
         except urllib.error.HTTPError as exc:
             if exc.code != 404:
                 raise
@@ -435,7 +438,21 @@ class TriliumClient:
                 ) from response_error
             if created_note_id != note_id:
                 raise RuntimeError("Trilium ignored the deterministic note ID")
-            readback = self.read(note_id)
+        return self.complete_create(note_id, payload, idempotency_key)
+
+    def complete_create(
+        self,
+        note_id: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> str:
+        """Complete and verify a deterministic or previously matched create."""
+        validate_payload(payload)
+        if not isinstance(note_id, str) or not note_id.strip():
+            raise ValidationError("Note ID is empty")
+        if not isinstance(idempotency_key, str) or not idempotency_key.strip():
+            raise ValidationError("Idempotency key is empty")
+        readback = self.read(note_id)
 
         if (
             readback.get("title") != payload["title"]
@@ -663,7 +680,9 @@ class KnowledgeWriter:
                 payload = record["payload"]
                 if operation == "create":
                     key = record["idempotencyKey"]
-                    if self.client.find_by_idempotency(key):
+                    existing_note_id = self.client.find_by_idempotency(key)
+                    if existing_note_id:
+                        self.client.complete_create(existing_note_id, payload, key)
                         result["deduplicated"] += 1
                     else:
                         self.client.create(payload, key)

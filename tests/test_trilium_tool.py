@@ -45,6 +45,9 @@ class FakeTriliumHandler(http.server.BaseHTTPRequestHandler):
     persist_put: ClassVar[bool] = True
     corrupt_created_content: ClassVar[bool] = False
     attribute_failures_remaining: ClassVar[int] = 0
+    attribute_failure_on_attempt: ClassVar[int | None] = None
+    attribute_attempt_count: ClassVar[int] = 0
+    invalid_create_responses_remaining: ClassVar[int] = 0
 
     @classmethod
     def reset(cls) -> None:
@@ -64,6 +67,9 @@ class FakeTriliumHandler(http.server.BaseHTTPRequestHandler):
         cls.persist_put = True
         cls.corrupt_created_content = False
         cls.attribute_failures_remaining = 0
+        cls.attribute_failure_on_attempt = None
+        cls.attribute_attempt_count = 0
+        cls.invalid_create_responses_remaining = 0
 
     def _record(self, body: bytes = b"") -> None:
         type(self).requests.append(
@@ -138,9 +144,26 @@ class FakeTriliumHandler(http.server.BaseHTTPRequestHandler):
             if type(self).corrupt_created_content:
                 content += "<p>server changed this</p>"
             type(self).contents[note_id] = content
+            if type(self).invalid_create_responses_remaining:
+                type(self).invalid_create_responses_remaining -= 1
+                invalid = b"{"
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(invalid)))
+                self.end_headers()
+                self.wfile.write(invalid)
+                return
             self._json(201, {"note": note, "branch": {"branchId": "branch_demo"}})
             return
         if self.path == "/etapi/attributes":
+            type(self).attribute_attempt_count += 1
+            if (
+                type(self).attribute_failure_on_attempt
+                == type(self).attribute_attempt_count
+            ):
+                type(self).attribute_failure_on_attempt = None
+                self._json(503, {"message": "temporarily unavailable"})
+                return
             if type(self).attribute_failures_remaining:
                 type(self).attribute_failures_remaining -= 1
                 self._json(503, {"message": "temporarily unavailable"})
@@ -650,6 +673,58 @@ class KnowledgeWriterTests(unittest.TestCase):
             ("label", "idempotencyKey", initial["idempotencyKey"]),
             attributes,
         )
+
+    def test_replay_completes_attributes_after_idempotency_label_was_written(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory, FakeTriliumServer() as server:
+            FakeTriliumHandler.attribute_failure_on_attempt = 2
+            outbox = Outbox(pathlib.Path(directory))
+            writer = KnowledgeWriter(TriliumClient(server.url, TEST_CREDENTIAL), outbox)
+            initial = writer.create(sample_payload())
+            replayed = writer.replay()
+            matching = [
+                note
+                for note in FakeTriliumHandler.notes.values()
+                if note["title"] == "Example analysis"
+            ]
+            attributes = {
+                (item["type"], item["name"], item["value"])
+                for item in matching[0]["attributes"]
+            }
+
+        self.assertEqual(initial["status"], "QUEUED")
+        self.assertEqual(replayed, {"sent": 0, "deduplicated": 1, "failed": 0})
+        self.assertEqual(len(matching), 1)
+        self.assertTrue(
+            {
+                ("label", "idempotencyKey", initial["idempotencyKey"]),
+                ("label", "type", "analysis"),
+                ("label", "status", "draft"),
+                ("label", "createdBy", "agent"),
+                ("relation", "project", "project_demo"),
+            }.issubset(attributes)
+        )
+
+    def test_create_queues_original_key_after_ambiguous_json_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, FakeTriliumServer() as server:
+            FakeTriliumHandler.invalid_create_responses_remaining = 1
+            outbox = Outbox(pathlib.Path(directory))
+            writer = KnowledgeWriter(TriliumClient(server.url, TEST_CREDENTIAL), outbox)
+            result = writer.create(sample_payload())
+            records = outbox.records()
+            record = outbox.load(records[0])
+            replayed = writer.replay()
+            matching = [
+                note
+                for note in FakeTriliumHandler.notes.values()
+                if note["title"] == "Example analysis"
+            ]
+
+        self.assertEqual(result["status"], "QUEUED")
+        self.assertEqual(record["idempotencyKey"], result["idempotencyKey"])
+        self.assertEqual(replayed, {"sent": 1, "deduplicated": 0, "failed": 0})
+        self.assertEqual(len(matching), 1)
 
     def test_create_queues_when_trilium_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory, unavailable_url() as url:
